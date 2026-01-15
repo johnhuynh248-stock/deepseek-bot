@@ -464,4 +464,161 @@ class EnhancedTradingBot:
             
         elif data.startswith('select_'):
             _, ticker, option_type, strike, expiration = data.split('_')
-            await self.confirm_trade(query, ticker, option_type.upper(), float(strike
+            await self.confirm_trade(query, ticker, option_type.upper(), float(strike), expiration)
+            
+        elif data.startswith('trade_'):
+            _, ticker, option_type, strike, expiration = data.split('_')
+            await self.place_trade(query, ticker, option_type.upper(), float(strike), expiration)
+            
+        elif data.startswith('pick_'):
+            _, ticker, direction = data.split('_')
+            await self.pick_command(update, context)
+            
+        elif data == 'close_chain':
+            await query.delete_message()
+    
+    async def show_buy_options(self, query, ticker, option_type):
+        """Show buy options interface"""
+        stock = yf.Ticker(ticker)
+        current_price = stock.info.get('regularMarketPrice', 0)
+        
+        if option_type == 'CALL':
+            strikes = [
+                current_price * 0.98,  # Slightly ITM
+                current_price,         # ATM
+                current_price * 1.02,  # Slightly OTM
+            ]
+        else:  # PUT
+            strikes = [
+                current_price * 1.02,  # Slightly ITM
+                current_price,         # ATM
+                current_price * 0.98,  # Slightly OTM
+            ]
+        
+        keyboard = []
+        for strike in strikes:
+            strike = round(strike, 2)
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"${strike} {option_type}",
+                    callback_data=f"select_{ticker}_{option_type.lower()}_{strike}_{self.get_next_friday()}"
+                )
+            ])
+        
+        keyboard.append([
+            InlineKeyboardButton(f"{self.emoji['cross']} Cancel", callback_data="cancel_buy")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"*Select Strike Price for {ticker} {option_type}*\n"
+            f"Current Price: ${current_price:.2f}",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    
+    async def confirm_trade(self, query, ticker, option_type, strike, expiration):
+        """Show trade confirmation"""
+        response = f"""
+{self.emoji['money']} *TRADE CONFIRMATION*
+
+*Ticker:* {ticker}
+*Option Type:* {option_type}
+*Strike Price:* ${strike:.2f}
+*Expiration:* {expiration}
+*Quantity:* 1 contract
+
+*Risk Warning:*
+• Options trading involves significant risk
+• You can lose your entire investment
+• Time decay (theta) will affect position
+• IV changes can impact premium
+
+*Do you want to proceed?*
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(f"{self.emoji['check']} Confirm Buy", 
+                                   callback_data=f"trade_{ticker}_{option_type.lower()}_{strike}_{expiration}"),
+                InlineKeyboardButton(f"{self.emoji['cross']} Cancel", 
+                                   callback_data="cancel_trade")
+            ]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+    
+    async def place_trade(self, query, ticker, option_type, strike, expiration):
+        """Place the actual trade"""
+        try:
+            # Place order through Tradier
+            result = self.tradier.place_order(
+                symbol=ticker,
+                quantity=1,
+                option_type=option_type.lower(),
+                strike=strike,
+                expiration=expiration
+            )
+            
+            if 'order' in result:
+                order_id = result['order']['id']
+                await query.edit_message_text(
+                    f"{self.emoji['check']} *ORDER EXECUTED!* {self.emoji['rocket']}\n\n"
+                    f"*Symbol:* {ticker}\n"
+                    f"*Type:* {option_type}\n"
+                    f"*Strike:* ${strike:.2f}\n"
+                    f"*Expiration:* {expiration}\n"
+                    f"*Quantity:* 1 contract\n"
+                    f"*Order ID:* {order_id}\n\n"
+                    f"*Next Steps:*\n"
+                    f"1. Set stop loss alert\n"
+                    f"2. Monitor theta decay\n"
+                    f"3. Consider profit targets",
+                    parse_mode='Markdown'
+                )
+            else:
+                error = result.get('errors', {}).get('error', 'Unknown error')
+                await query.edit_message_text(
+                    f"{self.emoji['cross']} *ORDER FAILED*\n\n"
+                    f"Error: {error}\n\n"
+                    f"Please try again or contact support.",
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            logger.error(f"Trade error: {e}")
+            await query.edit_message_text(
+                f"{self.emoji['cross']} *TRADE ERROR*\n\n"
+                f"An error occurred: {str(e)}\n"
+                f"Please try again later.",
+                parse_mode='Markdown'
+            )
+
+def main():
+    """Start the enhanced bot"""
+    bot = EnhancedTradingBot()
+    
+    application = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("status", bot.status_command))
+    application.add_handler(CommandHandler("options", bot.options_command))
+    application.add_handler(CommandHandler("pick", bot.pick_command))
+    application.add_handler(CommandHandler("trade", bot.trade_command))
+    application.add_handler(CommandHandler("positions", bot.positions_command))
+    application.add_handler(CommandHandler("analyze", bot.analyze_command))
+    application.add_handler(CommandHandler("help", bot.start))
+    
+    # Add callback handler
+    application.add_handler(CallbackQueryHandler(bot.button_callback))
+    
+    # Start bot
+    logger.info("Starting Enhanced Trading Bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
