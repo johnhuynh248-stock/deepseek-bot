@@ -9,43 +9,61 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.io as pio
+from typing import List
 
 from config import Config
-from indicator_analyzer import SessionRangeAnalyzer
+from indicator_analyzer import EnhancedSessionRangeAnalyzer
 from tradier_api import TradierAPI
 
-# Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-class TradingBot:
+class EnhancedTradingBot:
     def __init__(self):
-        self.analyzer = SessionRangeAnalyzer()
+        self.analyzer = EnhancedSessionRangeAnalyzer()
         self.tradier = TradierAPI()
         self.emoji = Config.EMOJI
         
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send welcome message"""
-        welcome_text = f"""
-{self.emoji['rocket']} *Welcome to Session Range Trading Bot* {self.emoji['rocket']}
+    def format_option_analysis(self, ticker: str, direction: str, confidence: float, 
+                              options: List[Dict], reasoning: List[str]) -> str:
+        """Format option analysis for display"""
+        direction_emoji = {
+            'CALL': f"{self.emoji['bull']} {self.emoji['up']}",
+            'PUT': f"{self.emoji['bear']} {self.emoji['down']}",
+            'NEUTRAL': self.emoji['neutral']
+        }
+        
+        analysis = f"""
+*{ticker} OPTION ANALYSIS* {self.emoji['money']}
 
-*Available Commands:*
-/status [TICKER] - Get trading signal for a ticker
-/analyze [TICKER] - Detailed analysis with options
-/trade [TICKER] [CALL/PUT] - Place an options trade
-/positions - View current positions
-/settings - Configure bot settings
-/help - Show this help message
+*Direction:* {direction_emoji[direction]} *{direction}*
+*Confidence:* {confidence:.0f}/100 {self.emoji['fire'] if confidence > 70 else ''}
 
-*Example:* `/status SPY` or `/trade AAPL CALL`
-        """
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+*Recommended Options:*
+"""
+        
+        for i, option in enumerate(options[:3], 1):
+            premium = option.get('premium_estimate', 'N/A')
+            analysis += f"""
+{i}. *{option['type']}* ${option['strike']:.2f}
+   • Delta: {option['delta']:.2f}
+   • Theta: {option['theta']:.3f}
+   • Risk: {option['risk_level']}
+   • Est. Premium: ${premium}
+   • {option['description']}
+"""
+        
+        analysis += f"\n*Analysis Factors:*\n"
+        for i, reason in enumerate(reasoning[:5], 1):
+            analysis += f"{i}. {reason}\n"
+        
+        return analysis
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command"""
+        """Enhanced /status command with option recommendations"""
         try:
             if not context.args:
                 await update.message.reply_text(
@@ -58,7 +76,7 @@ class TradingBot:
             
             # Show loading message
             loading_msg = await update.message.reply_text(
-                f"{self.emoji['chart']} Analyzing {ticker}..."
+                f"{self.emoji['chart']} Analyzing {ticker} for option opportunities..."
             )
             
             # Get historical data
@@ -71,11 +89,22 @@ class TradingBot:
             
             current_price = stock.info.get('regularMarketPrice', hist['Close'].iloc[-1])
             
-            # Analyze sessions
+            # Enhanced analysis
             session_data = self.analyzer.calculate_session_ranges(hist, ticker)
-            analysis = self.analyzer.analyze_breakouts(current_price, session_data)
+            direction, confidence, trade_type, reasoning = self.analyzer.determine_direction(
+                current_price, session_data, session_data['momentum']
+            )
             
-            # Calculate ATR for TP/SL
+            # Get next expiration
+            expirations = self.get_option_expirations(ticker)
+            next_expiry = expirations[0] if expirations else self.get_next_friday()
+            
+            # Pick optimal options
+            options = self.analyzer.option_picker(
+                ticker, direction, current_price, next_expiry
+            )
+            
+            # Calculate TP/SL
             high_low = hist['High'] - hist['Low']
             high_close = abs(hist['High'] - hist['Close'].shift())
             low_close = abs(hist['Low'] - hist['Close'].shift())
@@ -83,57 +112,83 @@ class TradingBot:
             true_range = ranges.max(axis=1)
             atr = true_range.rolling(window=14).mean().iloc[-1]
             
-            tp_sl = self.analyzer.calculate_tp_sl(current_price, analysis['direction'], atr, analysis['confidence'])
+            tp_sl = self.analyzer.calculate_tp_sl(
+                current_price, direction, atr, confidence,
+                option_type=direction if direction != 'NEUTRAL' else None
+            )
             
-            # Prepare response
-            direction_emoji = {
-                'BULLISH': f"{self.emoji['bull']} {self.emoji['up']}",
-                'BEARISH': f"{self.emoji['bear']} {self.emoji['down']}",
-                'NEUTRAL': self.emoji['neutral']
-            }
-            
+            # Format response
             response = f"""
-*{ticker} Analysis* {self.emoji['chart']}
+*{ticker} TRADING SIGNAL* {self.emoji['rocket']}
 
 *Current Price:* ${current_price:.2f}
-*Direction:* {direction_emoji[analysis['direction']]} {analysis['direction']}
-*Confidence Score:* {analysis['confidence']:.0f}/100 {self.emoji['fire'] if analysis['confidence'] > 70 else ''}
+*Signal:* {direction_emoji[direction]} *{direction}*
+*Confidence Score:* {confidence:.0f}/100 {self.emoji['fire'] if confidence > 70 else ''}
+*Expiration:* {next_expiry}
 
-*Session Ranges:*
-• Asian: ${session_data['sessions'].get('asian', {}).get('range', 0):.2f}
-• London: ${session_data['sessions'].get('london', {}).get('range', 0):.2f}
-• NY: ${session_data['sessions'].get('ny', {}).get('range', 0):.2f}
+*Session Analysis:*
+• Asian Range: ${session_data['sessions'].get('asian', {}).get('range', 0):.2f}
+• London Range: ${session_data['sessions'].get('london', {}).get('range', 0):.2f}
+• NY Range: ${session_data['sessions'].get('ny', {}).get('range', 0):.2f}
 
-*Key Levels:*
-• Support: ${analysis['levels'].get('support', 0):.2f}
-• Resistance: ${analysis['levels'].get('resistance', 0):.2f}
-• Mid: ${analysis['levels'].get('mid', 0):.2f}
+*Technical Indicators:*
+• RSI: {session_data['momentum']['rsi']:.1f}
+• MACD: {'Bullish' if session_data['momentum']['macd_hist'] > 0 else 'Bearish'}
+• Trend: {session_data['momentum']['trend']}
 
-*Trade Setup:*
+*Risk Management:*
 • Stop Loss: ${tp_sl['stop_loss']:.2f}
 • Take Profit: ${tp_sl['take_profit']:.2f}
 • Risk/Reward: {tp_sl['risk_reward']:.2f}:1
-
-*Breakouts:* {len(analysis['breakouts'])}
-            """
+"""
             
-            # Add breakout details
-            if analysis['breakouts']:
-                response += "\n\n*Recent Breakouts:*"
-                for breakout in analysis['breakouts'][-3:]:
-                    response += f"\n• {breakout['session'].title()}: {breakout['type']} by ${breakout['distance']:.2f}"
+            # Add option recommendations
+            if direction != 'NEUTRAL' and options:
+                response += f"\n*Recommended Options:*\n"
+                for i, opt in enumerate(options[:2], 1):
+                    premium = opt.get('premium_estimate', 'N/A')
+                    response += f"{i}. *{opt['type']}* ${opt['strike']:.2f}"
+                    response += f" (Delta: {opt['delta']:.2f}, Est: ${premium})\n"
             
-            # Create inline keyboard for actions
-            keyboard = [
+            # Add reasoning
+            if reasoning:
+                response += f"\n*Key Factors:*\n"
+                for i, reason in enumerate(reasoning[:3], 1):
+                    response += f"{i}. {reason}\n"
+            
+            # Create interactive keyboard
+            keyboard = []
+            
+            if direction == 'CALL':
+                keyboard.append([
+                    InlineKeyboardButton(f"{self.emoji['money']} Buy CALL", 
+                                       callback_data=f"buy_{ticker}_call"),
+                    InlineKeyboardButton(f"{self.emoji['chart']} View CALLs", 
+                                       callback_data=f"view_{ticker}_calls")
+                ])
+            elif direction == 'PUT':
+                keyboard.append([
+                    InlineKeyboardButton(f"{self.emoji['money']} Buy PUT", 
+                                       callback_data=f"buy_{ticker}_put"),
+                    InlineKeyboardButton(f"{self.emoji['chart']} View PUTs", 
+                                       callback_data=f"view_{ticker}_puts")
+                ])
+            
+            keyboard.extend([
                 [
-                    InlineKeyboardButton(f"{self.emoji['money']} Trade Call", callback_data=f"trade_{ticker}_call"),
-                    InlineKeyboardButton(f"{self.emoji['money']} Trade Put", callback_data=f"trade_{ticker}_put")
+                    InlineKeyboardButton(f"{self.emoji['chart']} Detailed Analysis", 
+                                       callback_data=f"analyze_{ticker}"),
+                    InlineKeyboardButton(f"{self.emoji['calendar']} Option Chain", 
+                                       callback_data=f"chain_{ticker}")
                 ],
                 [
-                    InlineKeyboardButton(f"{self.emoji['chart']} Detailed Analysis", callback_data=f"analyze_{ticker}"),
-                    InlineKeyboardButton(f"{self.emoji['calendar']} Options Chain", callback_data=f"options_{ticker}")
+                    InlineKeyboardButton(f"{self.emoji['clock']} Set Alert", 
+                                       callback_data=f"alert_{ticker}"),
+                    InlineKeyboardButton(f"{self.emoji['warning']} Risk Check", 
+                                       callback_data=f"risk_{ticker}")
                 ]
-            ]
+            ])
+            
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await loading_msg.edit_text(response, parse_mode='Markdown', reply_markup=reply_markup)
@@ -141,251 +196,272 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in status command: {e}")
             await update.message.reply_text(
-                f"{self.emoji['cross']} Error analyzing {ticker}. Please try again."
+                f"{self.emoji['cross']} Error analyzing {ticker}: {str(e)}"
             )
     
-    async def analyze_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /analyze command with detailed analysis"""
+    async def options_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /options command to show option chain"""
         try:
             if not context.args:
-                await update.message.reply_text("Please provide a ticker. Example: /analyze SPY")
-                return
-            
-            ticker = context.args[0].upper()
-            
-            # Get detailed analysis
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period='10d', interval='1h')
-            
-            # Create visualization
-            fig = go.Figure()
-            
-            # Add candlestick
-            fig.add_trace(go.Candlestick(
-                x=hist.index,
-                open=hist['Open'],
-                high=hist['High'],
-                low=hist['Low'],
-                close=hist['Close'],
-                name='Price'
-            ))
-            
-            # Add session ranges
-            analyzer = SessionRangeAnalyzer()
-            session_data = analyzer.calculate_session_ranges(hist, ticker)
-            
-            for session, data in session_data['sessions'].items():
-                fig.add_hline(y=data['high'], line_dash="dash", 
-                            annotation_text=f"{session.upper()} High",
-                            line_color="red")
-                fig.add_hline(y=data['low'], line_dash="dash",
-                            annotation_text=f"{session.upper()} Low",
-                            line_color="green")
-                fig.add_hline(y=data['mid'], line_dash="dot",
-                            line_color="orange")
-            
-            fig.update_layout(
-                title=f"{ticker} Session Range Analysis",
-                yaxis_title="Price",
-                xaxis_title="Date",
-                template="plotly_dark"
-            )
-            
-            # Save chart
-            chart_path = f"{ticker}_analysis.png"
-            pio.write_image(fig, chart_path, width=1200, height=800)
-            
-            # Send chart
-            with open(chart_path, 'rb') as chart:
-                await update.message.reply_photo(
-                    photo=chart,
-                    caption=f"{self.emoji['chart']} *{ticker} Detailed Analysis*\n\n"
-                           f"Asian Range: ${session_data['sessions'].get('asian', {}).get('range', 0):.2f}\n"
-                           f"London Range: ${session_data['sessions'].get('london', {}).get('range', 0):.2f}\n"
-                           f"NY Range: ${session_data['sessions'].get('ny', {}).get('range', 0):.2f}",
+                await update.message.reply_text(
+                    f"{self.emoji['warning']} Usage: `/options TICKER`\nExample: `/options SPY`",
                     parse_mode='Markdown'
                 )
+                return
+            
+            ticker = context.args[0].upper()
+            
+            loading_msg = await update.message.reply_text(
+                f"{self.emoji['calendar']} Fetching option chain for {ticker}..."
+            )
+            
+            # Get option chain from Tradier
+            expirations = self.get_option_expirations(ticker)
+            if not expirations:
+                await loading_msg.edit_text(f"No options available for {ticker}")
+                return
+            
+            next_expiry = expirations[0]
+            chain_data = self.tradier.get_options_chain(ticker, next_expiry)
+            
+            if 'options' not in chain_data:
+                await loading_msg.edit_text(f"No option data for {ticker}")
+                return
+            
+            # Get current price
+            stock = yf.Ticker(ticker)
+            current_price = stock.info.get('regularMarketPrice', 0)
+            
+            # Format option chain
+            response = f"""
+*{ticker} OPTION CHAIN* {self.emoji['money']}
+*Expiration:* {next_expiry}
+*Current Price:* ${current_price:.2f}
+
+*CALLS (Bullish)* {self.emoji['bull']}
+"""
+            
+            options = chain_data['options']['option']
+            calls = [opt for opt in options if opt['option_type'] == 'call']
+            puts = [opt for opt in options if opt['option_type'] == 'put']
+            
+            # Show nearest strikes for calls
+            calls.sort(key=lambda x: abs(float(x['strike']) - current_price))
+            for call in calls[:5]:
+                strike = float(call['strike'])
+                bid = call.get('bid', 0)
+                ask = call.get('ask', 0)
+                mid = (float(bid) + float(ask)) / 2 if bid and ask else 0
+                
+                response += f"""
+• ${strike:.2f}: Bid ${bid} | Ask ${ask}
+  Mid: ${mid:.2f} | {'ITM' if strike < current_price else 'OTM'}
+"""
+            
+            response += f"\n*PUTS (Bearish)* {self.emoji['bear']}\n"
+            
+            # Show nearest strikes for puts
+            puts.sort(key=lambda x: abs(float(x['strike']) - current_price))
+            for put in puts[:5]:
+                strike = float(put['strike'])
+                bid = put.get('bid', 0)
+                ask = put.get('ask', 0)
+                mid = (float(bid) + float(ask)) / 2 if bid and ask else 0
+                
+                response += f"""
+• ${strike:.2f}: Bid ${bid} | Ask ${ask}
+  Mid: ${mid:.2f} | {'ITM' if strike > current_price else 'OTM'}
+"""
+            
+            # Create selection keyboard
+            keyboard = []
+            for call in calls[:3]:
+                strike = float(call['strike'])
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"CALL ${strike:.2f}",
+                        callback_data=f"select_{ticker}_call_{strike}_{next_expiry}"
+                    )
+                ])
+            
+            for put in puts[:3]:
+                strike = float(put['strike'])
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"PUT ${strike:.2f}",
+                        callback_data=f"select_{ticker}_put_{strike}_{next_expiry}"
+                    )
+                ])
+            
+            keyboard.append([
+                InlineKeyboardButton(f"{self.emoji['cross']} Close", callback_data="close_chain")
+            ])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await loading_msg.edit_text(response, parse_mode='Markdown', reply_markup=reply_markup)
             
         except Exception as e:
-            logger.error(f"Error in analyze command: {e}")
-            await update.message.reply_text(f"Error analyzing {ticker}")
+            logger.error(f"Error in options command: {e}")
+            await update.message.reply_text(f"Error fetching options: {str(e)}")
     
-    async def trade_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /trade command"""
+    async def pick_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /pick command for automated option selection"""
         try:
-            if len(context.args) < 2:
+            if not context.args:
                 await update.message.reply_text(
-                    "Usage: /trade [TICKER] [CALL/PUT] [STRIKE] [EXPIRATION]\n"
-                    "Example: /trade AAPL CALL 180 2024-01-19"
+                    f"{self.emoji['warning']} Usage: `/pick TICKER [EXPIRATION]`\n"
+                    f"Example: `/pick AAPL` or `/pick SPY 2024-01-19`",
+                    parse_mode='Markdown'
                 )
                 return
             
             ticker = context.args[0].upper()
-            option_type = context.args[1].upper()
-            strike = float(context.args[2]) if len(context.args) > 2 else None
-            expiration = context.args[3] if len(context.args) > 3 else None
+            expiration = context.args[1] if len(context.args) > 1 else self.get_next_friday()
             
-            # Get options chain
-            if expiration is None:
-                # Get next Friday
-                today = datetime.now()
-                days_ahead = (4 - today.weekday()) % 7
-                if days_ahead == 0:
-                    days_ahead = 7
-                expiration = (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
+            loading_msg = await update.message.reply_text(
+                f"{self.emoji['chart']} Picking best option for {ticker}..."
+            )
             
-            # Show options selection
-            response = f"""
-{self.emoji['money']} *Options Trade Setup*
-
-*Ticker:* {ticker}
-*Type:* {option_type}
-*Expiration:* {expiration}
-
-Select a strike price:
-            """
+            # Get data and analysis
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period='5d', interval='15m')
+            current_price = stock.info.get('regularMarketPrice', hist['Close'].iloc[-1])
             
-            # Get options chain
-            chain_data = self.tradier.get_options_chain(ticker, expiration)
+            session_data = self.analyzer.calculate_session_ranges(hist, ticker)
+            direction, confidence, trade_type, reasoning = self.analyzer.determine_direction(
+                current_price, session_data, session_data['momentum']
+            )
             
-            keyboard = []
-            if 'options' in chain_data:
-                options = chain_data['options']['option']
-                # Filter by type and show nearest strikes
-                current_price = yf.Ticker(ticker).info['regularMarketPrice']
-                filtered_options = []
-                
-                for opt in options:
-                    if opt['option_type'].lower() == option_type.lower():
-                        filtered_options.append(opt)
-                
-                # Sort by proximity to current price
-                filtered_options.sort(key=lambda x: abs(float(x['strike']) - current_price))
-                
-                # Create buttons for nearest strikes
-                for opt in filtered_options[:5]:
-                    strike_price = float(opt['strike'])
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"${strike_price} (${opt.get('bid', 0)})",
-                            callback_data=f"confirm_{ticker}_{option_type}_{strike_price}_{expiration}"
-                        )
-                    ])
+            # Get option recommendations
+            options = self.analyzer.option_picker(
+                ticker, direction, current_price, expiration
+            )
             
-            keyboard.append([InlineKeyboardButton(f"{self.emoji['cross']} Cancel", callback_data="cancel_trade")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(response, parse_mode='Markdown', reply_markup=reply_markup)
-            
-        except Exception as e:
-            logger.error(f"Error in trade command: {e}")
-            await update.message.reply_text(f"Error setting up trade: {str(e)}")
-    
-    async def positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /positions command"""
-        try:
-            positions = self.tradier.get_account_positions()
-            
-            if 'positions' not in positions or not positions['positions']:
-                await update.message.reply_text(f"{self.emoji['money']} No open positions")
+            if not options:
+                await loading_msg.edit_text(f"No suitable options found for {ticker}")
                 return
             
-            response = f"{self.emoji['money']} *Current Positions*\n\n"
-            total_pnl = 0
+            # Format best option
+            best_option = options[0]
+            tp_sl = self.analyzer.calculate_tp_sl(
+                current_price, direction, 
+                session_data['sessions']['asian']['range'] if 'asian' in session_data['sessions'] else 1,
+                confidence,
+                option_type=direction
+            )
             
-            for pos in positions['positions']['position']:
-                symbol = pos.get('symbol', 'N/A')
-                quantity = pos.get('quantity', 0)
-                cost_basis = float(pos.get('cost_basis', 0))
-                current_price = float(pos.get('last_price', 0))
-                pnl = (current_price - cost_basis) * quantity
-                total_pnl += pnl
-                
-                response += f"*{symbol}*\n"
-                response += f"Qty: {quantity} | Avg: ${cost_basis:.2f}\n"
-                response += f"Current: ${current_price:.2f} | P&L: ${pnl:.2f}\n"
-                response += f"{'---'}\n"
+            response = f"""
+*{self.emoji['fire']} BEST OPTION PICK {self.emoji['fire']}
+
+*Ticker:* {ticker}
+*Current Price:* ${current_price:.2f}
+*Expiration:* {expiration}
+
+*Recommended Trade:*
+• *{best_option['type']}* ${best_option['strike']:.2f}
+• Delta: {best_option['delta']:.2f}
+• Theta: {best_option['theta']:.3f}
+• Risk Level: {best_option['risk_level']}
+• Est. Premium: ${best_option.get('premium_estimate', 'N/A')}
+
+*Trade Rationale:*
+• Direction Signal: {direction} ({confidence:.0f}/100 confidence)
+• {best_option['description']}
+• Max Profit: Unlimited
+• Max Loss: Premium Paid
+
+*Risk Management:*
+• Stop Loss: ${tp_sl['stop_loss']:.2f} (Underlying)
+• Take Profit: ${tp_sl['take_profit']:.2f} (Underlying)
+• Risk/Reward: {tp_sl['risk_reward']:.2f}:1
+
+*Key Factors:*
+"""
             
-            response += f"\n*Total P&L:* ${total_pnl:.2f}"
+            for i, reason in enumerate(reasoning[:3], 1):
+                response += f"{i}. {reason}\n"
             
-            await update.message.reply_text(response, parse_mode='Markdown')
+            # Action buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        f"{self.emoji['money']} Place This Trade",
+                        callback_data=f"trade_{ticker}_{best_option['type'].lower()}_{best_option['strike']}_{expiration}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"{self.emoji['chart']} See Alternatives",
+                        callback_data=f"alternatives_{ticker}_{direction}"
+                    ),
+                    InlineKeyboardButton(
+                        f"{self.emoji['warning']} Risk Analysis",
+                        callback_data=f"risk_{ticker}_{best_option['type']}_{best_option['strike']}"
+                    )
+                ]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await loading_msg.edit_text(response, parse_mode='Markdown', reply_markup=reply_markup)
             
         except Exception as e:
-            logger.error(f"Error in positions command: {e}")
-            await update.message.reply_text(f"Error fetching positions: {str(e)}")
+            logger.error(f"Error in pick command: {e}")
+            await update.message.reply_text(f"Error picking option: {str(e)}")
+    
+    def get_option_expirations(self, ticker: str) -> List[str]:
+        """Get available option expiration dates"""
+        try:
+            # Get options from yfinance
+            stock = yf.Ticker(ticker)
+            options = stock.options
+            
+            if not options:
+                # Generate standard expirations if none available
+                today = datetime.now()
+                expirations = []
+                for i in range(4):
+                    expiry = today + timedelta(days=7 * (i + 1))
+                    # Find Friday
+                    days_to_friday = (4 - expiry.weekday()) % 7
+                    if days_to_friday == 0:
+                        days_to_friday = 7
+                    expiry += timedelta(days=days_to_friday)
+                    expirations.append(expiry.strftime('%Y-%m-%d'))
+                return expirations
+            
+            return list(options)[:4]  # Return next 4 expirations
+            
+        except Exception as e:
+            logger.error(f"Error getting expirations: {e}")
+            return []
+    
+    def get_next_friday(self) -> str:
+        """Get next Friday's date as string"""
+        today = datetime.now()
+        days_ahead = (4 - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        next_friday = today + timedelta(days=days_ahead)
+        return next_friday.strftime('%Y-%m-%d')
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks"""
+        """Handle all button callbacks"""
         query = update.callback_query
         await query.answer()
         
         data = query.data
         
-        if data.startswith('trade_'):
-            # Handle trade button
+        if data.startswith('buy_'):
+            # Handle buy button
             _, ticker, option_type = data.split('_')
-            await query.edit_message_text(
-                f"{self.emoji['money']} Preparing {option_type.upper()} trade for {ticker}..."
-            )
-            # Continue with trade setup...
+            await self.show_buy_options(query, ticker, option_type.upper())
             
-        elif data.startswith('analyze_'):
-            ticker = data.split('_')[1]
-            await self.analyze_command(update, context)
+        elif data.startswith('view_'):
+            _, ticker, option_type = data.split('_')
+            await self.show_option_details(query, ticker, option_type.upper())
             
-        elif data.startswith('confirm_'):
-            # Confirm and place trade
+        elif data.startswith('select_'):
             _, ticker, option_type, strike, expiration = data.split('_')
-            
-            # Place order
-            result = self.tradier.place_order(
-                symbol=ticker,
-                quantity=1,
-                option_type=option_type.lower(),
-                strike=float(strike),
-                expiration=expiration
-            )
-            
-            if 'order' in result:
-                await query.edit_message_text(
-                    f"{self.emoji['check']} *Order Placed Successfully!*\n\n"
-                    f"*Symbol:* {ticker}\n"
-                    f"*Type:* {option_type.upper()}\n"
-                    f"*Strike:* ${strike}\n"
-                    f"*Expiration:* {expiration}\n"
-                    f"*Order ID:* {result['order']['id']}",
-                    parse_mode='Markdown'
-                )
-            else:
-                await query.edit_message_text(
-                    f"{self.emoji['cross']} *Order Failed*\n\n"
-                    f"Error: {result.get('errors', {}).get('error', 'Unknown error')}",
-                    parse_mode='Markdown'
-                )
-            
-        elif data == 'cancel_trade':
-            await query.edit_message_text(f"{self.emoji['cross']} Trade cancelled")
-
-def main():
-    """Start the bot"""
-    bot = TradingBot()
-    
-    # Create Application
-    application = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("status", bot.status_command))
-    application.add_handler(CommandHandler("analyze", bot.analyze_command))
-    application.add_handler(CommandHandler("trade", bot.trade_command))
-    application.add_handler(CommandHandler("positions", bot.positions_command))
-    application.add_handler(CommandHandler("help", bot.start))
-    
-    # Add callback query handler
-    application.add_handler(CallbackQueryHandler(bot.button_callback))
-    
-    # Start the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+            await self.confirm_trade(query, ticker, option_type.upper(), float(strike
